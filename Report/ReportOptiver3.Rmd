@@ -1,0 +1,751 @@
+---
+title: "Interdisciplinary Report"
+editor: visual
+date: "26th of May 2024"
+author:
+  - name: Optiver 3
+    affiliation: a
+address:
+  - code: a
+    address: The University of Sydney
+abstract: |
+  Optiver is a global market maker where options trading is a fundamental component of their activities. Because high-frequency trading involves risk management and opportunities, predicting future volatility is crucial. In this project, we utilised multivariate modelling methods including Vector Auto Regression and Dynamic Conditional Correlation GARCH and implemented these findings with Shiny web app. Our models demonstrated outstanding performance in forecasting realised volatility and provide valuable insights for trading strategies.
+papersize: letter
+fontsize: 9pt
+numbersections: true
+skip_final_break: yes
+secnumdepth: 3
+output:
+  pinp::pinp: default
+vignette: >
+  %\VignetteIndexEntry{Introduction to pinp}
+  %\VignetteKeywords{pinp,vignette}
+  %\VignettePackage{pinp}
+  %\VignetteEngine{knitr::rmarkdown}
+bibliography: main.bib
+---
+
+```{r init, echo=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE, fig.pos = "H")
+```
+
+```{r}
+install_if_missing <- function(packages) {
+  new_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+  if(length(new_packages)) install.packages(new_packages, dependencies = TRUE)
+  invisible(lapply(packages, library, character.only = TRUE))
+}
+
+required_packages <- c("tidyverse", "gridExtra", "pinp")
+
+install_if_missing(required_packages)
+```
+
+```{r load rds}
+feature_df <- readRDS("../RData/feature_df.rds")
+eval_df <- readRDS("../RData/eval_df.rds")
+MSE_var <- readRDS("../RData/MSE_var.rds")
+MSE_dcc <- readRDS("../RData/MSE_dcc.rds")
+MSE_lr <- readRDS("../RData/MSE_lr.rds")
+MSE_arma <- readRDS("../RData/MSE_arma.rds")
+QLIKE_var <- readRDS("../RData/QLIKE_var.rds")
+QLIKE_dcc <- readRDS("../RData/QLIKE_dcc.rds")
+QLIKE_lr <- readRDS("../RData/QLIKE_lr.rds")
+QLIKE_arma <- readRDS("../RData/QLIKE_arma.rds")
+example_actual_vol <- readRDS("../RData/example_actual_vol.rds")
+example_predicted_vol_var <- readRDS("../RData/example_predicted_vol_var.rds")
+example_future_vol_var <- readRDS("../RData/example_future_vol_var.rds")
+example_predicted_vol_dcc <- readRDS("../RData/example_predicted_vol_dcc.rds")
+example_future_vol_dcc <- readRDS("../RData/example_future_vol_dcc.rds")
+BS_MSE_dcc <- readRDS("../RData/BS_MSE_dcc.rds")
+BS_MSE_var <- readRDS("../RData/BS_MSE_var.rds")
+BS_QLIKE_dcc <- readRDS("../RData/BS_QLIKE_dcc.rds")
+BS_QLIKE_var <- readRDS("../RData/BS_QLIKE_var.rds")
+eigen_windows.df <- readRDS("../RData/eigen_windows.df.rds")
+beta.df <- readRDS("../RData/beta.df.rds")
+```
+
+# Executive Summary
+
+## Aim
+
+This interdisciplinary project developed a multivariate predictive model to help traders make informed trading floor decisions by providing accurate, fast, and stable volatility forecasts. To provide future prediction using historical time series data, a multitude of methods were used including unsupervised learning, multivariate modelling, stability and robustness, and a Shiny app for visualisation. In the discussion, implications of the model and limitations were highlighted and it was established that the final joint models proved to be a useful basis in deducing future forecasts compared to the univariate models that have been introduced.
+
+## Key Result
+
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+results <- rbind(
+  sapply(MSE_var, mean),
+  sapply(MSE_dcc, mean),
+  sapply(MSE_lr, mean),
+  sapply(MSE_arma, mean)
+)
+
+row_means <- rowMeans(results)
+```
+
+By approaching the described problem using sophisticated multivariate modelling methods including Vector Auto Regression and Dynamic Conditional Correlation GARCH, some innovative analysis and findings were obtained, giving multiple perspectives on volatility prediction. Thorough evaluation of different models indicates the outstanding performance of multivariate models in predicting realised volatility. This evaluation compared accuracy metrics of multivariate models against that of the benchmark univariate models such as Linear Regression and ARMA-GARCH that have been introduced. The mean Mean Squared Error (MSE) of DCC-GARCH across all clusters is `r signif(row_means[2], 3)` and appears to be the smallest, followed by the VAR model with its mean MSE determined to be `r signif(row_means[1], 3)`. On the other hand, the MSE of Linear Regression model is `r signif(row_means[3], 3)` while the ARMA-GARCH achieves a mean MSE of `r signif(row_means[4], 3)`.
+
+## Implementation
+
+Based on key results, our developed multivariate models for future short-term volatility prediction analysis are tailored to meet the demands of high-frequency traders (HFT). This is obtained by incorporating our predictive models in managing risks and planning informed strategies. Our interactive platform Shiny with its user-friendly interface and detailed analysis can provide traders with instant prediction and critical insights into market movements, ensuring that forecast is generated in a negligible period of time. Additional feature of the web app involves letting traders choose a different model from the optimal that has been developed for each cluster of stocks to gain a comparison between models.
+
+# Background
+
+Realised volatility is used to measure the daily price fluctuations of a security over a period of time. While low realised volatility indicates that daily price changes are minimal and predictable, high realised volatility implies security's price fluctuates significantly, indicating risk and uncertainty. In the context of the project where our target audience is High-Frequency Traders (HFT), accurately predicting realised volatility is extremely important due to the high-frequency nature at a trading floor. The objective of this project is to develop simple, interpretable and reliable predictive models to forecast future stocks' realised volatility, which are essential for options pricing at Optiver.
+
+## Dataset
+
+The dataset used in this project is provided by Optiver, including data on 112 stocks, presented in `.csv` format, each with more than 3000 non-sequential time_ids representing all transaction records within a 10-minute interval. Data for each stock consists of 9 numerical variables and 2 identifiers.
+
+-   `time_id` (identifier): A non-sequential identifier specific to each stock, representing transaction information within a 10-minute interval.
+-   `stock_id` (identifier): A virtual code assigned to real stocks in the market for use in this project.
+-   `seconds_in_bucket`: Sequential markers assigned every second within the 10-minute interval, ranging from 0 to 600, missing seconds_in_bucket indicates no transaction takes place.
+-   `bid_price1` & `bid_price2`: The price at which a purchaser is willing to buy.
+-   `ask_price1` & `ask_price2`: The price at which a seller states they are willing to accept.
+-   `bid_size1` & `bid_size2`: The quantity of a particular security that investors are prepared to buy at the given bid price.
+-   `ask_size1` & `ask_size2`: The quantity of a particular security that a market maker is offering to sell at the given ask price.
+
+# Methods
+
+## Modelling Approach
+
+It is well known that stocks from the same business sectors will have similar volatility patterns or price movements due to economic conditions and sector-specific trends. After thorough research on different approaches, we decided to deal with 112 stocks by applying unsupervised learning methods to group stocks into clusters based on their unique derived features. Due to the complexity of the dataset provided, our first goal was to reduce the dimension of the data. After clusters have been determined, a joint model that takes into account the historical log returns of all stocks inside each cluster is built with the use of rolling windows to evaluate performance.
+
+## Feature Engineering
+
+### Data Preprocessing
+
+The process starts with calculating key financial indicators such as Weighted Average Price (`WAP1` and `WAP2`), Bid-Ask Spread (`BidAskSpread1` and `BidAskSpread2`), and trading `volume` at each `time_id` for each stock. Based on the total number of `transactions` at each `time_id` across all stocks, we divided this distribution into three equal sectors: low, medium and high by determining the quantiles. This segmentation lets us randomly sample at least 1000 `time_id`s from each sector without replacement, ensuring diversity and randomness.
+
+After reducing dimension by choosing only 1000 `time_id`s, log returns are calculated for the selected `time_id` (Equation \ref{eq:log_return}). Then we divide the 10-minute horizon into non-overlapping 30-second intervals called buckets to derive realised volatility (Equation \ref{eq:volatility}). Some transformations on the data are processed in order to support later usage in unsupervised learning. Each `stock_id` at one `time_id` (i.e. `stock_0_16`) is considered an individual sample for future predictions, and key financial indicators from the raw data are aggregated as mean, medium, or standard deviation to create a comprehensive dataframe with 16 aggregated features.
+
+### Unsupervised Learning
+
+Cluster analysis is a key stage where identifying the underlying patterns and classifying stocks take place. This process is mainly implemented using the K-means clustering algorithm, which effectively groups data points into similar clusters, thus revealing the underlying similarities between stocks.
+
+By clustering each stock sample, we can identify groups of stocks that exhibit similar volatility patterns and behaviors (Figure \ref{fig:cluster-scatter}). This clustering process allows us to tailor our modeling approach to the specific characteristics of each cluster, thereby improving the accuracy and relevance of our volatility predictions.
+
+To determine the optimal number of clusters, the elbow method was used by plotting the within-cluster sum of squares (WSS) against the number of clusters and finding the point where the rate of decrease sharply changes. This elbow point shows diminishing returns from increasing clusters and helps choose the optimal number of clusters to minimise WSS and prevent overfitting. Three elbow point clusters were chosen as the optimal number in this case.
+
+Based on aggregated features in (Figure \ref{fig:feature-distributions}), some notable characteristics of each cluster is identified as below
+
+\- Cluster 1: particularly high trading `volumes` but low `WAP`, `BidAskSpread` and `log return`
+
+\- Cluster 2: higher values and variability in the `BidAskSpread`, `WAP` and `log return`
+
+\- Cluster 3: low `WAP` and `BidAskSpread` similar to Cluster 1, but with slightly lower spread variability.
+
+```{r sactter plot for clusters}
+# Sample 20% of data points in each cluster for visualisation
+set.seed(3888)
+pca_result <- prcomp(feature_df[-c(1:4)], center = TRUE, scale. = TRUE)
+
+feature_df$pca1 <- pca_result$x[, 1]
+feature_df$pca2 <- pca_result$x[, 2]
+
+sampled_df <- feature_df %>%
+  group_by(cluster) %>%
+  sample_frac(0.2, replace = FALSE) %>%
+  ungroup()
+
+p <- ggplot(sampled_df, aes(x = pca1, y = pca2, color = cluster, text = stock_time_id)) +
+  geom_point(size = 0.6) +
+  labs(x = "PC1", y = "PC2", color = "Cluster") +
+  theme_minimal() +
+  ggtitle('K-means Clustering Scatter Plot')  +
+  theme(
+    plot.title = element_text(size = 8),
+    axis.title.x = element_text(size = 6),    
+    axis.title.y = element_text(size = 6), 
+    axis.text.x = element_text(size = 5),
+    axis.text.y = element_text(size = 5),
+    legend.title = element_text(size = 6),
+    legend.text = element_text(size = 5)
+  )
+
+ggsave("figures/clusters_scatter.png", plot = p, width = 3, height = 2, units = "in")
+
+```
+
+```{r, results='asis'}
+cat("
+\\begin{figure}[htbp]
+\\centering
+\\includegraphics[width=\\columnwidth]{figures/clusters_scatter.png}
+\\caption{K-means Clustering Scatter Plot}
+\\label{fig:cluster-scatter}
+\\end{figure}
+")
+```
+
+```{r summary of clusters}
+# Summarize features by cluster
+# Remove unnecessary columns and group by 'cluster'
+cluster_summary <- feature_df[, c(-2, -3, -4, -21, -22)] %>%
+  group_by(cluster) %>%
+  summarise(across(everything(), list(mean = mean, median = median), .names = "{fn}_{col}"))
+
+# Convert data to long format for ggplot
+data_long <- pivot_longer(feature_df[, c(-2, -3, -4, -21, -22)], cols = -cluster, names_to = "Feature", values_to = "Value")
+
+# Create box plots of feature distributions by cluster
+p <- ggplot(data_long, aes(x = cluster, y = Value)) +
+  geom_boxplot() +
+  facet_wrap(~ Feature, scales = "free") + # Create separate plots for each feature
+  theme_minimal() +
+  labs(title = "Feature Distributions by Cluster", x = "Cluster", y = "Value") +
+  theme(
+    plot.title = element_text(size = 12),
+    axis.title.x = element_text(size = 10),    
+    axis.title.y = element_text(size = 10), 
+    axis.text.x = element_text(size = 9),
+    axis.text.y = element_text(size = 9),
+    strip.text = element_text(size = 9))
+
+ggsave("figures/clusters_summary.png", plot = p, width = 12, height = 6, units = "in")
+
+```
+
+```{r, results='asis'}
+cat("
+\\begin{figure*}[htbp]
+\\centering
+\\includegraphics[width=\\textwidth]{figures/clusters_summary.png}
+\\caption{Feature Distributions by Cluster}
+\\label{fig:feature-distributions}
+\\end{figure*}
+")
+```
+
+## Model Development
+
+### Multivariate GARCH Model
+
+The Dynamic Conditional Correlation (DCC) GARCH model extends the univariate GARCH model to a multivariate context, allowing for dynamic correlations between multiple time series. The DCC-GARCH model consists of two steps: modelling individual conditional variances and then modelling the conditional correlations [@bollerslev1990modelling]. This approach provides a comprehensive framework for understanding the co-movements and volatility interactions among multiple time series. (see Appendix for more details)
+
+### Vector AutoRegression Model
+
+A Vector AutoRegression (VAR) model is a multivariate time series model that captures the linear interdependencies among multiple time series. It is a system of equations where each variable is regressed on its own lagged values and the lagged values of all other variables in the model. This structure captures the interdependencies and feedback effects between the variables. VAR models are powerful tools for analysing how shocks propagate through a system and for making multivariate time series forecasts. (see Appendix for more details)
+
+## Evaluation
+
+### Rolling Windows
+
+Using rolling windows for assessing models is essential due to the dynamic nature of financial market. The basic concept involves defining a window of a fixed size and then sliding this window step-by-step through the data to perform calculations on each subset. The problem of dynamic changes of data can be efficiently handled by the rolling window, which uses the last observations to estimate parameters [@feng2024out].
+
+We start by defining the rolling window with a fixed window size (i.e., `window_size = 300s`) and systematically moving forward in a fixed step (i.e., `increment = 30s`). Within each window, multivariate models including VAR and DCC-GARCH and univariate models including Linear Regression and ARMA-GARCH are trained. Then, the future 30-second forecasts for each window are stored in lists for later analysis. This allows us to track how model performance and predictions evolve over time. The process repeats for each window, moving forward until the entire dataset has been covered (see more details in Appendix).
+
+### Mean Squared Error and Quasi-Likelihood
+
+In evaluating the performance of our forecasting models, we utilised two of the most widely used loss functions in the literature, namely Mean Squared Error (MSE) and Quasi-Likelihood (QLIKE) loss functions [@patton2011volatility]. The use of both MSE and QLIKE allows for a nuanced evaluation of model performance. While MSE provides a straightforward measure of average prediction error, QLIKE offers additional robustness, ensuring that the evaluation remains reliable even in the presence of extreme values (see more details in Appendix).
+
+For each model under each cluster of stocks, the predicted volatility values were compared against the actual observed data in terms of MSE and QLIKE, ensuring a comprehensive and robust assessment of the models' predictive accuracy, thereby facilitating the selection of the most effective model for forecasting volatility in financial time series under each cluster.
+
+## Model Stability
+
+Stability and robustness are the two main crucial factors in model evaluation besides accuracy performance metrics. Robustness determines whether the model is more likely to remain valid regardless of changes made in input data, while stability represents the assurance of reliable and consistent output despite the input data’s negligible changes. Model stability analysis for multivariate models is conducted after the calculation of accuracy metrics.
+
+### Stability
+
+Two methods of stability analysis are implemented: the block bootstrap and the eigenvalue. The block bootstrap involves simulating perturbations of the input data with each 30-second block bootstrapped, generating new blocks from a normal distribution with the original mean and variance. The segmentation into blocks ensures that the bootstrap sample retains the characteristics in original data, enhancing the analysis's reliability. Another approach, the eigenvalue formulated method uses the estimated coefficients of the existing models. Model is considered stable if the eigenvalues are between 0 and 1 [@lutkepohl2005new].
+
+### Robustness
+
+Through the rolling window method of training each model on a window of fixed-size interval, cross-validation is achieved by testing each of these trained models on the next 30 seconds. The high accuracy yielded by this method on the test data corresponds to a high level of robustness as well, due to the cross-validation effect achieved.
+
+# Results
+
+## Mean Squared Error and Quasi-Likelihood
+
+```{r, results='hide'}
+png("figures/MSE_plots.png", width = 800, height = 800)
+par(mar=c(3.5, 3.5, 3.5, 3.5), mfrow=c(4, 3))
+
+# Define models
+models_mse <- list(
+  "Vector Auto-Regression" = MSE_var,
+  "DCC-GARCH" = MSE_dcc,
+  "Linear Regression" = MSE_lr,
+  "ARMA-GARCH" = MSE_arma
+)
+
+# Loop through models and clusters to create boxplots
+for (model_name in names(models_mse)) {
+  for (i in 1:3) {
+    boxplot(models_mse[[model_name]][[as.character(i)]], horizontal = TRUE,
+            main = paste("MSE of Cluster", i, "\nUsing", model_name), cex.main = 2, cex.axis = 1.5)
+  }
+}
+
+par(mfrow=c(1, 1))
+dev.off()
+```
+
+```{r, results='hide'}
+png("figures/QLIKE_plots.png", width = 800, height = 800)
+par(mar=c(3.5, 3.5, 3.5, 3.5), mfrow=c(4, 3))
+
+# Define models
+models_qlike <- list(
+  "Vector Auto-Regression" = QLIKE_var,
+  "DCC-GARCH" = QLIKE_dcc,
+  "Linear Regression" = QLIKE_lr,
+  "ARMA-GARCH" = QLIKE_arma
+)
+
+# Loop through models and clusters to create boxplots
+for (model_name in names(models_qlike)) {
+  for (i in 1:3) {
+    boxplot(models_qlike[[model_name]][[as.character(i)]], horizontal = TRUE,
+            main = paste("QLIKE of Cluster", i, "\nUsing", model_name), cex.main = 2, cex.axis = 1.5)
+  }
+}
+
+par(mfrow=c(1, 1))
+dev.off()
+
+```
+
+MSE and QLIKE are both metrics where smaller values indicate better model performance. Lower MSE values signify more accurate predictions with less error, while lower QLIKE values indicate more precise quantile forecasts.
+
+Figure \ref{fig:MSE_plots} and Figure \ref{fig:QLIKE_plots} compare the MSE and QLIKE, respectively, of different clusters using four models including VAR, DCC-GARCH, Linear Regression, and ARMA-GARCH. In the multivariate models, VAR shows a reasonable spread of MSE and QLIKE values across all clusters, but with some variability and notable outliers, particularly in Cluster 2. In contrast, DCC-GARCH exhibits a tighter clustering of MSE and QLIKE values with fewer outliers in Cluster 2, which is more consistent and stable. This underscores VAR model is better for Cluster 1 and 3 whereas DCC-GARCH is more suitable for Cluster 2.
+
+```{r, results='asis'}
+cat("
+\\begin{figure}[htbp]
+\\centering
+\\includegraphics[width=\\columnwidth]{figures/MSE_plots.png}
+\\caption{MSE of Four Models in 3 Clusters}
+\\label{fig:MSE_plots}
+\\end{figure}
+")
+```
+
+```{r, results='asis'}
+cat("
+\\begin{figure}[htbp]
+\\centering
+\\includegraphics[width=\\columnwidth]{figures/QLIKE_plots.png}
+\\caption{QLIKE of Four Models in 3 Clusters}
+\\label{fig:QLIKE_plots}
+\\end{figure}
+")
+```
+
+This result also aligns with the characteristics of our clusters. The fundamental distinction between VAR and DCC-GARCH models lies in their treatment of variance. VAR models assume homoscedasticity [@lutkepohl2005new], meaning the variance of time series remains constant over time. For Clusters 1 and 3, both clusters exhibit stable and low variability in `BidAskSpread`, `WAP`, and `log return`. This stability in the relationships among features makes the VAR model an appropriate choice. In contrast, DCC-GARCH models account for heteroskedasticity [@engle2002dynamic], where the variance can change dynamically. Cluster 2 exhibits higher values and significant variability in `BidAskSpread`, `WAP`, and `log return`, indicating fluctuating volatility over time. This makes DCC-GARCH an ideal choice for modeling Cluster 2.
+
+In contrast, the univariate models display markedly different performance. Both Linear Regression and ARMA-GARCH perform poorly, with large and impractical MSE values across all clusters, compared to the multivariate models. Overall, the analysis highlights the superior performance and stability of multivariate models over univariate models in predicting the volatility of stocks of each cluster.
+
+## Predicted Volatility of a Stock Example
+
+Figure \ref{fig:example_vol} illustrates the predictions of volatility for a stock example (stock 10 at `time_id` 4126) over a future 30-second period. It contains two subplots, each depicting the performance of different predictive models. The grey line represents the realized volatility, the blue and red lines show the predicted volatility for evaluating time buckets 11 to 20 (i.e. 301s - 600s) and unseen time bucket 21 (i.e. 601s - 630s). Through the plot, we can effectively and straight compare the actual volatility with the predicted volatility from two different models, providing insights into their prediction accuracy and performance.
+
+```{r}
+vol_var_plt <- rbind(example_actual_vol, example_predicted_vol_var, example_future_vol_var) %>%
+  ggplot(aes(x = time_bucket, y = volatility, color = source)) +
+    geom_line() + 
+    geom_point() +
+    scale_color_manual(values = c("Realised Volatility" = "grey", 
+                                  "Vector Auto-Regression Predicted" = "blue",
+                                  "Vector Auto-Regression Future" = "red")) +
+    labs(title = "Volatility and Predictions for Example Stock for future 30 seconds",
+         x = "Time Bucket",
+         y = "Volatility",
+         color = "Source") +
+    theme_minimal()
+
+vol_dcc_plt <- rbind(example_actual_vol, example_predicted_vol_dcc, example_future_vol_dcc) %>%
+  ggplot(aes(x = time_bucket, y = volatility, color = source)) +
+    geom_line() +
+    geom_point() +
+    scale_color_manual(values = c("Realised Volatility" = "grey", 
+                                  "DCC-GARCH Predicted" = "blue",
+                                  "DCC-GARCH Future" = "red")) +
+    labs(title = "Volatility and Predictions for Example Stock for future 30 seconds",
+         x = "Time Bucket",
+         y = "Volatility",
+         color = "Source") +
+    theme_minimal()
+
+
+p <- arrangeGrob(vol_var_plt, vol_dcc_plt, nrow = 2)
+
+ggsave("figures/example_vol.png", plot = p, width = 12, height = 6, units = "in")
+
+```
+
+```{r, results='asis'}
+cat("
+\\begin{figure*}[htbp]
+\\centering
+\\includegraphics[width=\\textwidth]{figures/example_vol.png}
+\\caption{Volatility and Predictions for Example Stock for future 30 seconds}
+\\label{fig:example_vol}
+\\end{figure*}
+")
+```
+
+## Stability
+
+```{r, results='hide'}
+models <- list(
+  "Vector Auto-Regression" = list(MSE_var, BS_MSE_var),
+  "DCC-GARCH" = list(MSE_dcc, BS_MSE_dcc)
+)
+
+png("figures/Bs_MSE_plots.png", width = 800, height = 600)
+
+par(mar=c(3.5, 3.5, 3.5, 3.5), mfrow=c(2, 3))
+
+
+for (model_name in names(models)) {
+  for (i in 1:3) {
+    boxplot(models[[model_name]][[1]][[as.character(i)]],
+            models[[model_name]][[2]][[as.character(i)]], horizontal = TRUE,
+            main = paste("MSE of Cluster", i, "\nUsing", model_name), 
+            names = c("Original", "Bootstrap"),
+            cex.main = 2, cex.axis = 1.5)
+  }
+}
+
+par(mfrow=c(1, 1))
+
+dev.off()
+```
+
+```{r, results='hide'}
+models <- list(
+  "Vector Auto-Regression" = list(QLIKE_var, BS_QLIKE_var),
+  "DCC-GARCH" = list(QLIKE_dcc, BS_QLIKE_dcc)
+)
+
+png("figures/Bs_QLIKE_plots.png", width = 800, height = 600)
+par(mar=c(3.5, 3.5, 3.5, 3.5), mfrow=c(2, 3))
+
+
+for (model_name in names(models)) {
+  for (i in 1:3) {
+    boxplot(models[[model_name]][[1]][[as.character(i)]],
+            models[[model_name]][[2]][[as.character(i)]], horizontal = TRUE,
+            main = paste("QLIKE of Cluster", i, "\nUsing", model_name), 
+            names = c("Original", "Bootstrap"),
+            cex.main = 2, cex.axis = 1.5)
+  }
+}
+
+par(mfrow=c(1, 1))
+
+dev.off()
+```
+
+```{r}
+var_stable_check <- c()
+for (row.index in seq(nrow(eigen_windows.df))){
+  for (col.index in seq(length(eigen_windows.df))){
+    if (eigen_windows.df[row.index, col.index] < 1){
+      var_stable_check <- c(var_stable_check, TRUE)
+    }else{
+      var_stable_check <- c(var_stable_check, FALSE)
+    }
+  }
+}
+
+```
+
+```{r}
+dcc_stable_check <- c()
+for (row.index in seq(nrow(beta.df))){
+  for (col.index in seq(length(beta.df))){
+    if (beta.df[row.index, col.index] < 1){
+      dcc_stable_check <- c(dcc_stable_check, TRUE)
+    }else{
+      dcc_stable_check <- c(dcc_stable_check, FALSE)
+    }
+  }
+}
+```
+
+The stability analysis produces positive results (Figure \ref{fig:Bs_MSE_plots} and \ref{fig:Bs_QLIKE_plots} in Appendix): the bootstrapped model outputted similar MSE performance metrics with a negligible difference compared to the original model. The eigenvalue approach also indicates a high level of stability for multivariate models, with stability values for the VAR model at `r signif((sum(var_stable_check == TRUE)/length(var_stable_check))*100, 3)`% and the DCC-GARCH model at `r signif((sum(dcc_stable_check == TRUE)/length(dcc_stable_check))*100, 4)`%.
+
+## Shiny App
+
+Models are deployed under Shiny web app after evaluation and assessment. The web app lets users choose a stock and predict log returns or realised volatility. An interactive plot shows historical data and future prediction using the optimal model for the cluster the stock belongs to. The Shiny web app also allows comparison by letting end-users choose a different model from the optimal one, providing users that have financial and statistics background with insights into the rationale behind the selection of the optimal model.
+
+Shiny App can be accessed [here](https://rachelnguyen.shinyapps.io/Optiver3/).
+
+# Discussion
+
+The higher performance of the multivariate models, namely VAR and DCC-GARCH, mean that the knowledge of the trading patterns for numerous stocks are informative for prediction of return and volatility for each other. This suggests either that the trading activity associated with one stock affects that of another, or they are both affected by some other external factor.
+
+One limitation of the dataset is that stocks’ names are not given, hence, external sources cannot provide more information. Our predictive models would also not be useful for the prediction of volatility over greater time periods, such as hours, days or weeks. This is because the models were trained on 10-minute time segments and the trends or seasonality properties over larger time periods would not be captured by the models. Also, the models only provide a forecast for the next 30 seconds. Both of these limitations mean that, while the forecasts are useful for high-frequency traders, they will not be applicable to long-term investors, who will require a longer forecast for a much greater order of magnitude in time.
+
+Clustering was used for variable selection for the multivariate models, such that combinations of stock and time segment of the same cluster were included in the same model. In the future, more work could be done to reduce the number of variables in each model, as the clusters themselves were large. More advanced methods like association rule mining or correlations may be needed to understand how stock relationships affect log return and volatility. The use of clustering allows our predictive models to be generalised to trading patterns of different properties. This makes it versatile, in that it is useful in various stock activity patterns.
+
+# Conclusion
+
+By using multivariate time series models, including VAR and DCC-GARCH models, our research has achieved remarkable results in predicting realised volatility. Evidence shows that multivariate models have lower MSE and QLIKE compared to univariate models, indicating superior prediction accuracy and stability. Moreover, stability analysis further confirms the robustness of our model. A high proportion of eigenvalues of VAR and DCC-GARCH models are less than 1, which satisfies the stability conditions. Although our developed model performed well in the current study, there is still room for improvement. Future work could consider using all stock data from a cluster for model training to further improve prediction accuracy. Besides, our model can be further optimised to adapt to changes in market conditions and new financial instruments.
+
+Overall, our project provides a powerful tool for predicting realised volatility in financial markets, which is not only of importance to practitioners in the financial industry, but also acts as a tool for the academic community to further understand the principle of realised volatility prediction. The development of our model and platform is expected to play an important role in the high-frequency trading environment, especially in risk management and trading strategy planning.
+
+# Appendix
+
+## Log Return at Time $t$
+
+\begin{equation}
+\label{eq:log_return}
+r_t = \log\left(\frac{\text{WAP1}_t}{\text{WAP1}_{t-1}}\right)
+\end{equation}
+
+## Volatility at Time $t$
+
+\begin{equation}
+\label{eq:volatility}
+\sigma_t = \sqrt{\sum_{i=1}^{n} r_i ^2}
+\text{ where } r_i \text{ is the log return for the } i \text{-th period.}
+\end{equation}
+
+## Multivariate GARCH Model
+
+### Theoretical Equations
+
+The DCC-GARCH model consists of two steps: modeling individual conditional variances and then modeling the conditional correlations.
+
+-   **Step 1: Univariate GARCH Models for Each Series**
+
+    For each time series $y_{i,t}$, the univariate GARCH(1,1) model proposed by @bollerslev1986generalized can be expressed as:
+
+    $$ y_{i,t} = \mu_i + \epsilon_{i,t} $$
+
+    $$ \epsilon_{i,t} = \sigma_{i,t} z_{i,t} $$
+
+    $$ \sigma_{i,t}^2 = \omega_i + \alpha_i \epsilon_{i,t-1}^2 + \beta_i \sigma_{i,t-1}^2 $$
+
+    where:
+
+    -   $y_{i,t}$ is the observed time series for the $i$-th variable at time $t$.
+
+    -   $\mu_i$ is the mean of the $i$-th process.
+
+    -   $\epsilon_{i,t}$ is the error term for the $i$-th process.
+
+    -   $\sigma_{i,t}^2$ is the conditional variance for the $i$-th process.
+
+    -   $z_{i,t}$ is a white noise process with mean zero and variance one.
+
+    -   $\omega_i$, $\alpha_i$, and $\beta_i$ are the parameters of the GARCH model for the $i$-th process.
+
+-   **Step 2: Modeling Dynamic Conditional Correlations**
+
+    The DCC GARCH model proposed by @engle2002dynamic can be written as: $$ y_t = \mathbf{C}x_t + \epsilon_{t} $$
+
+    where $\epsilon_{t} = \mathbf{H}_t^{1/2} v_t$ and $v_t$ is an $m$ × $1$ vector of normal, independent, and identically distributed innovations.
+
+    Let $\mathbf{D}_t$ be a diagonal matrix of conditional standard deviations $\sigma_{i,t}$:
+
+    $$ \mathbf{D}_t = \text{diag}(\sigma_{1,t}, \sigma_{2,t}, \ldots, \sigma_{k,t}) $$
+
+    The conditional covariance matrix $\mathbf{H}_t$ is given by:
+
+    $$ \mathbf{H}_t = \mathbf{D}_t \mathbf{R}_t \mathbf{D}_t $$
+
+    where $\mathbf{R}_t$ is the conditional correlation matrix. The DCC model specifies $\mathbf{R}_t$ as:
+
+    $$ \mathbf{R}_t = \mathbf{Q}_t^*{}^{-1} \mathbf{Q}_t \mathbf{Q}_t^*{}^{-1} $$
+
+    $$ \mathbf{Q}_t = (1 - \alpha - \beta) \mathbf{Q} + \alpha (\mathbf{z}_{t-1} \mathbf{z}_{t-1}') + \beta \mathbf{Q}_{t-1} $$
+
+    where:
+
+    -   $\mathbf{Q}_t$ is the evolving covariance matrix of standardized residuals $\mathbf{z}_t$.
+    -   $\mathbf{Q}$ is the unconditional covariance matrix of $\mathbf{z}_t$.
+    -   $\mathbf{z}_t = \mathbf{D}_t^{-1} \mathbf{\epsilon}_t$ is the vector of standardized residuals.
+    -   $\alpha$ and $\beta$ are parameters of the DCC model.
+    -   $\mathbf{Q}_t^*$ is a diagonal matrix with the square roots of the diagonal elements of $\mathbf{Q}_t$.
+
+### Practical Implementation in R
+
+The provided R code specifies and fits the DCC-GARCH model in our project:
+
+``` r
+# Univariate GARCH Model Specification
+uni_spec <- ugarchspec(
+  variance.model = list(
+      garchOrder = c(1,1)),
+      mean.model = list(
+      armaOrder = c(0,0), 
+      include.mean = TRUE
+  )
+)
+
+# DCC-GARCH Model Specification and Fitting
+dcc_model <- dccfit(
+  dccspec(uspec = 
+            multispec(replicate(ncol(df), 
+                                uni_spec, 
+                                simplify = FALSE)),
+          dccOrder = c(1, 1), distribution = 'mvnorm'),
+  data = df, cluster = cl)
+```
+
+In this implementation:
+
+-   `uni_spec` specifies a univariate GARCH(1,1) model with no ARMA terms for each time series.
+
+-   `dccspec` specifies a DCC-GARCH model using the univariate specifications.
+
+-   `dccfit` fits the DCC-GARCH model to the multivariate data.
+
+## Vector AutoRegression Model
+
+### **Theoretical Equations**
+
+A VAR model is a multivariate time series model that captures the linear interdependencies among multiple time series. For a $k$-dimensional time series $\mathbf{y}_t = (y_{1,t}, y_{2,t}, \ldots, y_{k,t})'$, the VAR(p) model proposed by @lutkepohl2005new can be written as:
+
+$$ \mathbf{y}_t = \sum_{i=1}^p \mathbf{A}_i \mathbf{y}_{t-i} + \mathbf{u}_t $$
+
+where:
+
+-   $\mathbf{y}_t$ is a $k$-dimensional vector of time series at time $t$.
+
+-   $\mathbf{A}_i$ are $k \times k$ coefficient matrices for $i = 1, 2, \ldots, p$.
+
+-   $p$ is the lag order of the VAR model.
+
+-   $\mathbf{u}_t$ is a $k$-dimensional vector of error terms (white noise).
+
+### Practical Implementation in R
+
+The provided R code specifies and fits a VAR model using the `vars` package in our project:
+
+``` r
+# Vector AutoRegression (VAR) Model Specification
+var_model <- vars::VAR(df, p = 4, type = "none")
+```
+
+In this implementation:
+
+-   `p = 4` specifies the lag order of the VAR model.
+
+-   `type = "none"` indicates that the model does not include a constant term or deterministic trend.
+
+## Rolling Windows
+
+In our project, we use a rolling window approach (Figure \ref{fig:rolling_window}) to forecast log returns $y$. We set a window size $n = 300$. For every 30-second (i.e. `increment = 30`) time points $t$ from $n$ to $T$ (where $T$ is the total number of observations, $T = 600$ in our project), we use the data from $t - n + 1$ to $t$ to train our model.
+
+$$
+\text{Training data: } \{ y_{t-n+1}, y_{t-n+2}, \ldots, y_t \}
+$$
+
+We fit our models using the data in the current window then predict the next 30-second log returns $\{ y_{t+1}, y_{t+2}, \ldots, y_{t+30} \}$.
+
+Then we repeat the above process for $t = \{n+30\cdot 1, n+30\cdot2,... , T\}$
+
+```{r, results='asis'}
+cat("
+\\begin{figure}[htbp]
+\\centering
+\\includegraphics[width=\\columnwidth]{figures/rolling_window.png}
+\\caption{Rolling Window Schematic}
+\\label{fig:rolling_window}
+\\end{figure}
+")
+```
+
+## Mean Squared Error and Quasi-Likelihood
+
+$$
+\text{MSE} = \frac{1}{T} \sum_{t=1}^T (\text{RV}_t - \text{F}_t)^2
+$$
+
+$$
+\text{QLIKE} = \frac{1}{T} \sum_{t=1}^T \left( \frac{\text{RV}_t}{\text{F}_t} - \log\left(\frac{\text{RV}_t}{\text{F}_t}\right) - 1 \right)
+$$
+
+where $\text{RV}_t$ and $\text{F}_t$ are the realised volatility and forecast volatility at time $t$, respectively.
+
+## Stability
+
+### Bootstrap
+
+Reference to Figure \ref{fig:Bs_MSE_plots} and \ref{fig:Bs_QLIKE_plots}.
+
+### Eigenvalue
+
+The model's coefficients are vectors that must be formatted into a squared matrix. In R, the coefficients can be extracted from the built model using one of the input functions `coef()` or `coefficients()`. Then, the matrix is formatted using this code `companion_matrix <- as.matrix(array(data = estimate_coeff, dim = c(n, n)))`, where n is the dimension of the square matrix. Eigenvalue is calculated from the input function: `eigen()` and extracted using the code: `$value`. According to @lutkepohl2005new, the model is stable when the absolute eigenvalue is less than 1.
+
+$$
+ Ax = \lambda x \hspace{0.3cm} \text{(eigenvalue equation)}
+$$
+
+$$
+ det(A - \lambda I) = 0 \hspace{0.3cm} \text{(eigenvalue characteristics)}
+$$
+
+$$
+|\lambda| \leq 1 \hspace{0.3cm} \text{(stability check)}
+$$
+
+where
+
+$A$ : The squared or companion matrix
+
+$I$ : represents identity matrix
+
+$\lambda$ : Eigenvalue of square matrix $A$
+
+$x$ : A non-zero vector, Eigenvector
+
+
+```{r, results='asis'}
+cat("
+\\begin{figure}[htbp]
+\\centering
+\\includegraphics[width=\\columnwidth]{figures/Bs_MSE_plots.png}
+\\caption{MSE of Bootstrap vs Original Dataset}
+\\label{fig:Bs_MSE_plots}
+\\end{figure}
+")
+```
+
+```{r, results='asis'}
+cat("
+\\begin{figure}[htbp]
+\\centering
+\\includegraphics[width=\\columnwidth]{figures/Bs_QLIKE_plots.png}
+\\caption{QLIKE of Bootstrap vs Original Dataset}
+\\label{fig:Bs_QLIKE_plots}
+\\end{figure}
+")
+```
+
+# Student contributions
+
+## Jiaying Ma - 510581039
+
+A preliminary framework, which included data pre-processing, clustering, and a Vector AutoRegression model, was constructed by me. During the model developments, I was responsible for the combination, refinement, comparisons and evaluations of all models. I was responsible for presenting all of the models and evaluations during the presentation event. I included the model components in the methods and results sections of the report.
+
+## Rachel Nguyen - 520495548
+
+In the coding section of the project, I performed feature engineering including data processing, feature selection, unsupervised learning and univariate ARMA-GARCH model. During the presentation, I prepared the schematic for rolling window, presented the feature engineering part, and did a demo on Shiny. In the report, I wrote executive summary (abstract, aim, key results, implementation), part of the background, methods (modelling approach, data preprocessing and unsupervised learning) and interactive platform's description. I was responsible for developing the Shiny web app.
+
+## Pwint Myat Chal - 510260411
+
+I worked on eigenvalue stability analysis and multivariate XGBoost model although XGBoost model was disregarded due to poor performance. In the report section, I worked on part of the executive summary and background, model stability, and eigenvalue appendix section. Additionally, I prepare and present the conclusion part of the presentation.
+
+## Lindsay Liu - 520329025
+
+I contributed to the code section by building the linear regression model, the multivariate linear regression model, and evaluating the models. I collaborated with Pwint on assessing the stability of the VAR model. Additionally, I wrote the Background section and feature engineering in the Methods sections of the report.
+
+## Sacha Jensen - 510513719
+
+I worked on the code for the multivariate GARCH model. I worked on the code for the block-bootstrap stability analysis. I wrote the discussion section, parts of the model selection section, and parts of the stability analysis section, in the report. I presented on stability in the presentation.
+
+## Janice Li - 520041600
+
+During the project, I collaborated with Sacha to assess the stability of a multivariate GARCH model. Additionally, I attempted to apply the ARIMA model was unsuccessful because I didn’t account for the multivariate nature of the data. And I wrote the conclusion section of the report and presented the K-means clustering in the presentation.
+
+# Reference
+
+::: {#refs}
+:::

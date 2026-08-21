@@ -1,0 +1,13 @@
+# Large raw dataset
+RData/stock_file.rds
+
+# R temporary files
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# macOS
+.DS_Store
+
+

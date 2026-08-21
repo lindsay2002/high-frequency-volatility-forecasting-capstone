@@ -1,0 +1,1309 @@
+---
+title: "Optiver Volatility Prediction"
+author: "Optiver 3"
+date: "2024-05-14"
+output: html_document
+execute:
+  cache: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+```{r message=FALSE, warning=FALSE, show=FALSE}
+# Function to install packages if not already installed
+install_if_missing <- function(packages) {
+  new_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+  if(length(new_packages)) install.packages(new_packages, dependencies = TRUE)
+  invisible(lapply(packages, library, character.only = TRUE))
+}
+
+# List of required packages
+required_packages <- c("tidyverse", "rugarch", "data.table", "plotly", "cluster",
+                       "class", "vars", "rmgarch", "parallel", "gridExtra", "factoextra")
+
+# Install and load packages
+install_if_missing(required_packages)
+
+```
+
+## Load all stocks
+
+```{r}
+# Read 112 stock files into R environment. Each file is store as an element in a list called stock_file
+read_stock_files <- function(directory_path) {
+  dir_stock_files <- list.files(directory_path)
+  stock_file <- list()
+  for (file_name in dir_stock_files) {
+    stock_file[[file_name]] <- fread(file.path(directory_path, file_name))
+  }
+  return(stock_file)
+}
+
+stock_file = read_stock_files("individual_book_train")
+
+# NOTE: We won't include original datasets in our submission.
+
+# Instead, to save your time, you may want to load pre-saved RData of stock dataframes.
+# They are exactly the same as the ones on Canvas.
+
+# Please uncomment the following readRDS.
+# stock_file <- readRDS("RData/stock_file.rds")
+```
+
+## Calculate related metrics
+
+```{r Calculate related metrics}
+# Calculate WAP1, WAP2, BidAskSpread1, BidAskSpread2 and volume of each transaction
+for (i in 1:length(stock_file)) {
+  stock_file[[i]] <- stock_file[[i]] |> 
+    mutate(WAP1 = (bid_price1 * ask_size1 + ask_price1 * bid_size1) / (bid_size1 + ask_size1)) |> 
+    mutate(WAP2 = (bid_price2 * ask_size2 + ask_price2 * bid_size2) / (bid_size2 + ask_size2)) |>  
+    mutate(BidAskSpread1 = (ask_price1/bid_price1) - 1) |> 
+    mutate(BidAskSpread2 = (ask_price2/bid_price2) - 1) |> 
+    mutate(volume = bid_size1 + ask_size1 + bid_size2 + ask_size2)
+}
+```
+
+## Choosing time_id based on the frequency of transactions
+
+```{r time_id selection, warning=FALSE, message=FALSE}
+# Count the number of transactions for each time_id of each stock_id
+trans_list <- list()
+for (i in 1:length(stock_file)) {
+  trans <- stock_file[[i]] |> 
+    group_by(time_id, stock_id, ) |> 
+    summarise(transactions = n(), .groups = "drop")
+  trans_list[[names(stock_file)[i]]] <- trans
+}
+
+# Sum up the number of transactions for each time_id across all stock_id
+transactions_data <- do.call(rbind, trans_list) |>
+  arrange(time_id) |>
+  group_by(time_id) |>
+  summarize(transactions = sum(transactions))
+
+# Split the distribution of number of transactions into three levels: low, medium and high
+breaks <- quantile(transactions_data$transactions, probs = c(0, 1/3, 2/3, 1))
+labels <- c("low", "medium", "high")
+
+# Determine the level for each time_id
+transactions_data <- transactions_data |> 
+  mutate(transaction_level = cut(transactions, breaks = breaks, labels = labels, include.lowest = TRUE))
+```
+
+```{r}
+ggplot(data = transactions_data, aes(x = transactions)) +
+  geom_histogram(bins = 50) +
+  labs(x = "Transactions", y = "Frequency") +
+  theme_minimal() +
+  geom_vline(xintercept = breaks, linetype = "dashed", color = "red")
+```
+
+```{r}
+# For each level, sample ~ 333 time_ids without replacement so that the total number of time_id is 1000
+set.seed(3888)
+
+low_level <- transactions_data |> 
+  filter(transaction_level == "low") |> 
+  sample_n(1000/3, replace = FALSE)
+
+medium_level <- transactions_data |> 
+  filter(transaction_level == "medium") |> 
+  sample_n(1000/3, replace = FALSE)
+
+high_level <- transactions_data |> 
+  filter(transaction_level == "high") |> 
+  sample_n(334, replace = FALSE)
+
+time.id.levels <- bind_rows(low_level, medium_level, high_level)
+```
+
+```{r}
+# 1000 time_ids vector
+time.id.list <- time.id.levels |> arrange(time_id) |> pull(time_id)
+```
+
+## Calculate log returns and volatility
+
+```{r log returns and volatility}
+# This step is only performed on 1000 time_ids that we have determined before. Calculate log returns for each time_id of a stock. For each time_id, divide into a 30-second bucket to calculate volatility.
+
+comp_vol <- function(x) {return(sqrt(sum(x ^ 2)))}
+
+log_return_list <- list()
+vol_list <- list()
+
+for (j in 1:length(stock_file)) {
+  
+  log_r_list <- list()
+  time_IDs <- time.id.list
+  stock_id <- unique(stock_file[[j]]$stock_id)
+
+  log_returns <- stock_file[[j]] %>% 
+    filter(time_id %in% time_IDs) %>%
+    group_by(time_id) %>%
+    reframe(
+      log_return = log(WAP1[-1] / WAP1[1:(n() - 1)]),
+      seconds_in_bucket = seconds_in_bucket[-1]
+    ) %>%
+    mutate(stock_id = stock_id)
+
+  log_return_list[[names(stock_file)[j]]] <- log_returns
+  
+  log_r <- log_returns |>  mutate(time_bucket = ceiling(seconds_in_bucket / 30))
+  vol <- aggregate(log_return ~ stock_id + time_bucket + time_id, data = log_r, FUN = comp_vol)
+  colnames(vol) <- c('stock_id', 'time_bucket', 'time_id', 'volatility')
+  
+  vol_list[[names(stock_file)[j]]] <- vol
+  
+}
+```
+
+## Feature dataframe
+
+```{r Feature dataframe}
+# For each combination of stock_id_time_id e.g. stock_0_16, calculate mean and sd log returns
+log_return_df.ls <- list()
+
+for (i in 1:length(stock_file)) {
+  
+  log_return_df.ls[[names(stock_file)[i]]] <- log_return_list[[i]] |> 
+  group_by(time_id, ) |> 
+  summarize(
+    stock_id = sub("\\.csv", "", names(stock_file)[i]),
+    mean_log_return = mean(log_return),
+    sd_log_return = sd(log_return)
+  )
+}
+
+log_return_df <- do.call(rbind, log_return_df.ls) |> arrange(time_id)
+
+```
+
+```{r}
+# For each combination of stock_id_time_id e.g. stock_0_16, calculate those features listed below
+time_id_df.ls <- list()
+
+for (i in 1:length(stock_file)) {
+  
+  time_id_df.ls[[names(stock_file)[i]]] <- stock_file[[i]] |> 
+    filter(time_id %in% time.id.list) |>
+    group_by(time_id) |> 
+    summarize(
+      stock_id = sub("\\.csv", "", names(stock_file)[i]),
+      mean_WAP1 = mean(WAP1),
+      med_WAP1 = median(WAP1),
+      sd_WAP1 = sd(WAP1),
+      mean_WAP2 = mean(WAP2),
+      med_WAP2 = median(WAP2),
+      sd_WAP2 = sd(WAP2),
+      mean_BidAskSpread1 = mean(BidAskSpread1),
+      med_BidAskSpread1 = median(BidAskSpread1),
+      sd_BidAskSpread1 = sd(BidAskSpread1),
+      mean_BidAskSpread2 = mean(BidAskSpread2),
+      med_BidAskSpread2 = median(BidAskSpread2),
+      sd_BidAskSpread2 = sd(BidAskSpread2),
+      mean_volume = mean(volume),
+      transactions = n()
+    )
+}
+
+time_id_df <- do.call(rbind, time_id_df.ls) |> arrange(time_id)
+```
+
+```{r}
+# Merge the two dataframe above into one feature dataframe called feature_df, 16 features in total
+feature_df <- merge(log_return_df, time_id_df, by = c("stock_id", "time_id")) |>
+  mutate(stock_time_id = paste0(stock_id, "_", time_id), .before = 1) |>
+  arrange(time_id)
+```
+
+## K-Means Clustering
+
+```{r K-Means Clustering, warning=FALSE}
+# Elbow method to determine the optimal k for K-Means Clustering
+wss <- sapply(1:10, function(k) kmeans(feature_df[-(1:3)], centers = k)$tot.withinss)
+plot(1:10, wss, type = "b", xlab = "Number of Clusters (k)", ylab = "Within-cluster Sum of Squares (WSS)", main = "Elbow Method for Optimal k")
+```
+
+```{r warning=FALSE}
+#Apply K-Means clustering with k = 3
+set.seed(3888)
+
+cluster_number = 3
+
+normalized_data <- scale(feature_df[-(1:3)])
+kmeans <- kmeans(normalized_data, centers = cluster_number)
+
+fviz_cluster(kmeans, data = feature_df[-(1:3)])
+```
+
+```{r}
+# Add a column with cluster label for each stock_time_id into the feature dataframe
+feature_df <- feature_df %>% mutate(cluster = as.character(kmeans$cluster), .before = 1)
+```
+
+```{r}
+# Sample 20% of data points in each cluster for visualisation
+set.seed(3888)
+pca_result <- prcomp(feature_df[-c(1:4)], center = TRUE, scale. = TRUE)
+
+feature_df$pca1 <- pca_result$x[, 1]
+feature_df$pca2 <- pca_result$x[, 2]
+
+sampled_df <- feature_df %>%
+  group_by(cluster) %>%
+  sample_frac(0.2, replace = FALSE) %>%
+  ungroup()
+
+gg <- ggplot(sampled_df, aes(x = pca1, y = pca2, color = cluster, text = stock_time_id)) +
+  geom_point(size = 0.6) +
+  labs(x = "PC1", y = "PC2", color = "Cluster") +
+  theme_minimal() +
+  ggtitle('K-means Clustering Scatter Plot')
+
+ggplotly(gg, tooltip = "text")
+
+```
+
+We summarizds the features by cluster and visualized the distribution of features across clusters using box plots. The goal is to provide a clear understanding of how different features vary across clusters.
+
+```{r summary of clusters}
+# Summarize features by cluster
+# Remove unnecessary columns and group by 'cluster'
+cluster_summary <- feature_df[, c(-2, -3, -4, -21, -22)] %>%
+  group_by(cluster) %>%
+  summarise(across(everything(), list(mean = mean, median = median), .names = "{fn}_{col}"))
+
+# Convert data to long format for ggplot
+data_long <- pivot_longer(feature_df[, c(-2, -3, -4, -21, -22)], cols = -cluster, names_to = "Feature", values_to = "Value")
+
+# Create box plots of feature distributions by cluster
+ggplot(data_long, aes(x = cluster, y = Value)) +
+  geom_boxplot() +
+  facet_wrap(~ Feature, scales = "free") + # Create separate plots for each feature
+  theme_minimal() +
+  labs(title = "Feature Distributions by Cluster", x = "Cluster", y = "Value")
+
+```
+
+## Cluster
+
+```{r}
+# For each cluster, use 50 stock_time_id to build model
+set.seed(3888)
+eval_df <- feature_df %>%
+  group_by(cluster) %>%
+  sample_n(50, replace = FALSE) %>%
+  ungroup()
+
+# Retrieve log return data for each stock_time_id from the log_return_list that we have created before. Second_in_buckets ranges from 1-600, if a stock_time_id does not have a transaction at any second_in_buckets, log return will be filled with 0.
+stock_unique_id <- gsub("[^0-9]", "", names(stock_file))
+
+cluster_feature_ls <- list()
+
+for (cluster_id in 1:3) {
+
+  combined_stock_log_r <- data.frame()
+  
+  for (i in 1:length(log_return_list)) {
+
+    stock <- eval_df |> 
+      filter(cluster == cluster_id & stock_id == paste0('stock_', stock_unique_id[[i]])) |> 
+      dplyr::select(stock_id, time_id) |> 
+      arrange(stock_id) |> 
+      pull(time_id)
+    
+    stock_log_r <- log_return_list[[i]][log_return_list[[i]]$time_id %in% stock, ]
+    
+    combined_stock_log_r <- bind_rows(combined_stock_log_r, stock_log_r) |> 
+      distinct()
+  }
+  
+  combined_stock_log_r <- combined_stock_log_r %>%
+    mutate(stock_time_id = paste0("stock_", stock_id, "_", time_id))
+  
+  transformed_data <- combined_stock_log_r |> 
+    dplyr::select(stock_time_id, seconds_in_bucket, log_return) |> 
+    complete(stock_time_id, seconds_in_bucket = 1:600, fill = list(log_return = 0)) |> 
+    pivot_wider(names_from = stock_time_id, values_from = log_return)
+  
+  cluster_feature_ls[[paste0("cluster_", cluster_id)]] <- transformed_data
+}
+
+```
+
+```{r}
+# Build a feature dataframe for linear regression model, where each stock_time_id will be splitted into 20 buckets of 30 seconds
+cluster_feature_wider <- data.frame()
+
+for(i in 1: nrow(eval_df)){
+  
+  row <- eval_df[i, ]
+  
+  stock_df <- stock_file[[paste0(row$stock_id, ".csv")]] %>%
+    filter(time_id == row$time_id) %>%
+    mutate(time_bucket = ceiling(seconds_in_bucket / 30)) %>%
+    group_by(time_id, time_bucket) %>%
+    summarize(
+      mean_WAP1 = mean(WAP1),
+      med_WAP1 = median(WAP1),
+      sd_WAP1 = sd(WAP1),
+      mean_WAP2 = mean(WAP2),
+      med_WAP2 = median(WAP2),
+      sd_WAP2 = sd(WAP2),
+      mean_BidAskSpread1 = mean(BidAskSpread1),
+      med_BidAskSpread1 = median(BidAskSpread1),
+      sd_BidAskSpread1 = sd(BidAskSpread1),
+      mean_BidAskSpread2 = mean(BidAskSpread2),
+      med_BidAskSpread2 = median(BidAskSpread2),
+      sd_BidAskSpread2 = sd(BidAskSpread2),
+      mean_volume = mean(volume),
+      transactions = n(),
+       .groups = 'drop'
+    )
+  
+  vol <- (vol_list[[paste0(row$stock_id, ".csv")]] %>%
+    filter(time_id == row$time_id))[, -3] %>% dplyr::select(-stock_id)
+  
+  merge_df <- right_join(stock_df, vol, by = "time_bucket") %>%
+    arrange(time_bucket) %>%
+    mutate(
+      stock_time_id = row$stock_time_id,
+      stock_id = row$stock_id,
+      cluster = row$cluster, 
+      .before = 1)
+  
+  cluster_feature_wider <- rbind(cluster_feature_wider, merge_df)
+  
+}
+
+
+cluster_feature_wider <- cluster_feature_wider %>% mutate(across(everything(), ~ifelse(is.na(.), 0, .)))
+cluster_feature_wider_cluster <- cluster_feature_wider %>% split(cluster_feature_wider$cluster)
+
+```
+
+
+## Model Assessment
+
+### Check Stationary of Dataset
+
+```{r warning=FALSE}
+for(i in 1:3){
+  lag_order <- vector()
+  
+  for(j in 2: ncol(cluster_feature_ls[[i]])){
+    original_adf = tseries::adf.test(unlist(cluster_feature_ls[[i]][, j]), alternative = "stationary")
+    if (original_adf$p.value > 0.05) {
+      cat("WARNING: not stationary")
+    }
+  }
+}
+```
+
+### Build Models
+
+```{r}
+# Define the univariate GARCH(1,1) specification without ARMA terms for the mean model
+uni_spec <- ugarchspec(
+  variance.model = list(
+      garchOrder = c(1,1)),  # GARCH(1,1) order
+      mean.model = list(
+      armaOrder = c(0,0),    # No ARMA terms in the mean model
+      include.mean = TRUE    # Include a mean term in the model
+  )
+)
+
+# Define the univariate ARMA(1,1)-GARCH(1,1) specification with normal distribution for residuals
+arma_spec <- ugarchspec(
+  variance.model = list(
+    model = "sGARCH",       # Use standard GARCH model
+    garchOrder = c(1, 1)),  # GARCH(1,1) order
+  mean.model = list(
+    armaOrder = c(1, 1)),   # ARMA(1,1) order for the mean model
+  distribution.model = "norm" # Assume normally distributed residuals
+)
+```
+
+```{r}
+# Function to forecast using a fitted VAR model
+forecast_var_model <- function(var_model) {
+  # Predict the next 30 time points using the VAR model
+  forecast <- predict(var_model, n.ahead = 30)
+  # Extract the forecasted values and combine them into a matrix
+  pc_forecasts_matrix <- do.call(cbind, lapply(forecast$fcst, function(x) x[, "fcst"]))
+  # Transpose the matrix to match the desired format
+  return(t(pc_forecasts_matrix))
+}
+
+# Function to forecast using a fitted DCC-GARCH model
+forecast_dcc_model <- function(dcc_model) {
+  # Simulate the next 30 time points using the DCC-GARCH model
+  forecast <- dccsim(dcc_model, n.sim = 30, startMethod = "sample", rseed = 3888)@msim$simX[[1]]
+  # Transpose the forecast matrix to match the desired format
+  pc_forecasts_matrix <- t(forecast)
+  # Set the row names of the matrix to the asset names from the DCC model
+  rownames(pc_forecasts_matrix) <- dcc_model@model$modeldata$asset.names
+  return(pc_forecasts_matrix)
+}
+
+# Function to forecast using a fitted ARMA-GARCH model
+forecast_arma_model <- function(arma_model) {
+  # Simulate future paths for the next 30 time points using the ARMA-GARCH model
+  future.path <- fitted(ugarchpath(arma_model, n.sim = 30, m.sim = 1000))
+  # Replace NA values in the future path with 0
+  future.path[is.na(future.path)] <- 0
+  # Calculate the mean of the standard deviations across simulations and return it
+  return(mean(apply(future.path, 2, sd)))
+}
+
+# Function to perform feature selection using stepwise regression
+feature_selection <- function(df){
+  # Define the null model with only the intercept
+  null_model <- lm(volatility~1, data = df)
+  # Define the full model with all potential predictors
+  full_model <- lm(volatility~., data = df)
+
+  # Perform stepwise regression using forward selection
+  df_forward <- stepAIC(null_model, direction = "forward", 
+                        scope = list(lower = null_model, upper = full_model),
+                        trace = FALSE)
+  
+  # Return the selected feature names
+  return(labels(terms(df_forward)))
+}
+
+```
+
+For each cluster, we performs rolling window forecasting by fitting VAR, DCC-GARCH, Linear Regression, and ARMA-GARCH models to the data in each window. The forecasts and models are stored for later analysis. This approach allows for dynamic and accurate volatility prediction tailored to the unique characteristics of each stock cluster.
+
+```{r model, warning=FALSE}
+# Set seed for reproducibility
+set.seed(3888)
+
+# Define rolling window parameters
+number_of_buckets <- 10
+window_size <- number_of_buckets * 30
+increment <- 30
+
+# Initialize lists to store forecasts and models for each cluster
+forecasts_var.ls <- list()
+forecasts_dcc.ls <- list()
+forecasts_lr.ls <- list()
+forecasts_arma.ls <- list()
+var_models.ls <- list()
+dcc_models.ls <- list()
+
+# Create a parallel processing cluster
+cl <- makeCluster(detectCores() - 1)
+
+# Iterate over each cluster
+for (i in 1:length(cluster_feature_ls)) {
+  
+  cluster <- cluster_feature_ls[[i]]
+  cat("Working with cluster", i, "\n")
+  
+  # Initialize local lists to store forecasts and models for the current cluster
+  forecasts_var <- list()
+  forecasts_dcc <- list()
+  forecasts_lr <- list()
+  forecasts_arma <- list()
+  var_models <- list()
+  dcc_models <- list()
+  
+  j = 1
+  
+  # Identify unique stock and time combinations within the cluster
+  unique_combinations <- unique(cluster_feature_wider_cluster[[i]][, c("stock_id", "time_id")])
+  
+  # Perform rolling window forecasting
+  for (t in seq(window_size, nrow(cluster) - 30, by = increment)) {
+    
+    cat("    window from", t - window_size + 1, "to", t, "\n")
+    
+    # Extract data for the current window
+    df <- cluster[(t - window_size + 1):t, -1]
+   
+    # Fit VAR model and store forecasts and models
+    var_model <- vars::VAR(df, p = 4, type = "none")
+    forecasts_var[[j]] <- forecast_var_model(var_model)
+    var_models[[j]] <- var_model
+
+    # Fit DCC-GARCH model and store forecasts and models
+    dcc_model <- dccfit(
+      dccspec(uspec = multispec(replicate(ncol(df), uni_spec, simplify = FALSE)),
+              dccOrder = c(1, 1), distribution = 'mvnorm'),
+      data = df, cluster = cl)
+
+    forecasts_dcc[[j]] <- forecast_dcc_model(dcc_model)
+    dcc_models[[j]] <- dcc_model
+    
+    # Perform feature selection for linear regression
+    x = feature_selection(cluster_feature_wider_cluster[[i]][, c(-1, -2, -3, -4, -5)])
+    formula <- paste("volatility ~", paste(x, collapse = " + "))
+    
+    # Iterate over unique stock and time combinations
+    for (combo in 1:nrow(unique_combinations)) {
+      
+      current_stock_id <- unique_combinations$stock_id[combo]
+      current_time_id <- unique_combinations$time_id[combo]
+      stock_time <- paste(current_stock_id, current_time_id, sep = "_")
+    
+      # Extract window data and test data for the current combination
+      window_data <- cluster_feature_wider_cluster[[i]] %>%
+        filter(stock_id == current_stock_id, time_id == current_time_id) %>%
+        arrange(time_bucket) %>%
+        filter(time_bucket > (t - window_size) / 30 & time_bucket <= (t / 30))
+      
+      test_data <- cluster_feature_wider_cluster[[i]] %>%
+        filter(stock_id == current_stock_id, time_id == current_time_id) %>%
+        arrange(time_bucket) %>%
+        filter(time_bucket == (t / 30 + 1))
+      
+      if (nrow(window_data) > 0 & nrow(test_data) > 0) {
+        
+        # Fit linear regression model and store forecasts
+        model <- lm(formula, data = window_data)
+        forecasts_lr[[stock_time]][[as.character(j)]] <- predict(model, newdata = test_data)
+        
+        # Fit ARMA-GARCH model and store forecasts
+        arma_garch <- ugarchfit(spec = arma_spec, data = unlist(df[, stock_time]), solver = 'hybrid')
+        fspec <- getspec(arma_garch)
+        setfixed(fspec) <- as.list(coef(arma_garch))
+        forecasts_arma[[stock_time]][[as.character(j)]] <- forecast_arma_model(fspec)
+        
+      }
+    }
+    j <- j + 1
+    
+  }
+  
+  # Store models and forecasts for the final window
+  var_models[[j]] <- vars::VAR(cluster[301:600, -1], p = 4, type = "none")
+  dcc_models[[j]] <- dccfit(
+    dccspec(uspec = multispec(replicate(ncol(cluster[301:600, -1]), uni_spec, simplify = FALSE)),
+            dccOrder = c(1, 1), distribution = 'mvnorm'),
+    data = cluster[301:600, -1], cluster = cl)
+
+  cat("\n")
+  
+  # Store forecasts and models for the current cluster
+  forecasts_var.ls[[i]] <- forecasts_var
+  forecasts_dcc.ls[[i]] <- forecasts_dcc
+  forecasts_lr.ls[[i]] <- forecasts_lr
+  forecasts_arma.ls[[i]] <- forecasts_arma
+  var_models.ls[[i]] <- var_models
+  dcc_models.ls[[i]] <- dcc_models
+}
+
+# Stop the parallel processing cluster
+stopCluster(cl)
+
+```
+
+### MSE and QLIKE
+
+For each prediction, we calculate the Mean Squared Error (MSE) and Quasi-Likelihood (QLIKE) metrics to assess models.
+
+```{r MSE and QLIKE}
+# Initialize lists to store MSE and QLIKE for each model
+MSE_var <- list()
+QLIKE_var <- list()
+
+MSE_dcc <- list()
+QLIKE_dcc <- list()
+
+MSE_lr <- list()
+QLIKE_lr <- list()
+
+MSE_arma <- list()
+QLIKE_arma <- list()
+
+# Iterate over each cluster (assumed to be 3 clusters)
+for (i in 1:3) {
+  
+  # Filter evaluation data frame for the current cluster
+  filtered_df <- eval_df %>% filter(cluster == as.character(i))
+  
+  # Retrieve forecasts for the current cluster
+  prediction_var <- forecasts_var.ls[[i]]
+  prediction_dcc <- forecasts_dcc.ls[[i]]
+  prediction_lr <- forecasts_lr.ls[[i]]
+  prediction_arma <- forecasts_arma.ls[[i]]
+
+  # Iterate over each row in the filtered evaluation data frame
+  for (j in 1:nrow(filtered_df)) {
+    
+    # Initialize lists to store predicted and actual volatilities
+    predicted_vol_var <- list()
+    predicted_vol_dcc <- list()
+    predicted_vol_lr <- list()
+    predicted_vol_arma <- list()
+    
+    actual_vol <- list()
+    
+    # Get the current row
+    row <- filtered_df[j, ]
+    index <- 1
+    
+    # Filter the actual volatility data for the current stock and time
+    filtered_vol <- vol_list[[paste0(row$stock_id, ".csv")]] %>% filter(time_id == row$time_id)
+    
+    # Iterate over the predictions for the current cluster
+    for (k in 1:length(prediction_var)) {
+      
+      # Calculate the corresponding time bucket
+      bucket <- ceiling(((k - 1) * 30 + window_size + 1) / 30)
+      actual.vol <- filtered_vol %>% filter(time_bucket == bucket) %>% .$volatility
+      
+      # Check if actual volatility data is available and valid
+      if (length(actual.vol) > 0 & all(actual.vol != 0)) {
+        # Store the predicted volatilities
+        predicted_vol_var[[index]] <- comp_vol(prediction_var[[k]][row$stock_time_id, ])
+        predicted_vol_dcc[[index]] <- comp_vol(prediction_dcc[[k]][row$stock_time_id, ])
+        predicted_vol_lr[[index]] <- prediction_lr[[row$stock_time_id]][[as.character(k)]]
+        predicted_vol_arma[[index]] <- prediction_arma[[row$stock_time_id]][[as.character(k)]]
+        
+        # Store the actual volatilities
+        actual_vol[[index]] <- actual.vol
+        index <- index + 1
+      }
+    }
+    
+    # Calculate and store MSE for each model
+    MSE_var[[as.character(i)]] <- c(MSE_var[[as.character(i)]], 
+                                    mean((unlist(actual_vol) - unlist(predicted_vol_var)) ^ 2))
+    MSE_dcc[[as.character(i)]] <- c(MSE_dcc[[as.character(i)]],
+                                    mean((unlist(actual_vol) - unlist(predicted_vol_dcc)) ^ 2))
+    MSE_lr[[as.character(i)]] <- c(MSE_lr[[as.character(i)]], 
+                                   mean((unlist(actual_vol) - unlist(predicted_vol_lr)) ^ 2))
+    MSE_arma[[as.character(i)]] <- c(MSE_arma[[as.character(i)]], 
+                                     mean((unlist(actual_vol) - unlist(predicted_vol_arma)) ^ 2))
+    
+    # Calculate and store QLIKE for each model
+    QLIKE_var[[as.character(i)]] <- c(QLIKE_var[[as.character(i)]], 
+                                      mean(unlist(actual_vol) / unlist(predicted_vol_var) - 
+                                             log(unlist(actual_vol) /unlist(predicted_vol_var)) - 1))
+    
+    QLIKE_dcc[[as.character(i)]] <- c(QLIKE_dcc[[as.character(i)]],
+                                      mean(unlist(actual_vol) / unlist(predicted_vol_dcc) -
+                                             log(unlist(actual_vol) / unlist(predicted_vol_dcc)) - 1))
+    
+    QLIKE_lr[[as.character(i)]] <- c(QLIKE_lr[[as.character(i)]], 
+                                     mean(unlist(actual_vol) / unlist(predicted_vol_lr) -
+                                            log(unlist(actual_vol) / unlist(predicted_vol_lr)) - 1))
+    
+    QLIKE_arma[[as.character(i)]] <- c(QLIKE_arma[[as.character(i)]], 
+                                       mean(unlist(actual_vol) / unlist(predicted_vol_arma) -
+                                              log(unlist(actual_vol) / unlist(predicted_vol_arma))- 1))
+  }
+}
+
+```
+
+```{r}
+par(mar=c(2, 2, 2, 2), mfrow=c(4, 3))
+
+models <- list(
+  "Vector Auto-Regression" = MSE_var,
+  "DCC-GARCH" = MSE_dcc,
+  "Linear Regression" = MSE_lr,
+  "ARMA-GARCH" = MSE_arma
+)
+
+for (model_name in names(models)) {
+  for (i in 1:3) {
+    boxplot(models[[model_name]][[as.character(i)]], horizontal = TRUE,
+            main = paste("MSE of Cluster", i, "\nUsing", model_name), cex.main = 0.9)
+  }
+}
+
+par(mfrow=c(1, 1))
+
+```
+
+```{r}
+par(mar=c(2, 2, 2, 2), mfrow=c(4, 3))
+
+models <- list(
+  "Vector Auto-Regression" = QLIKE_var,
+  "DCC-GARCH" = QLIKE_dcc,
+  "Linear Regression" = QLIKE_lr,
+  "ARMA-GARCH" = QLIKE_arma
+)
+
+for (model_name in names(models)) {
+  for (i in 1:3) {
+    boxplot(models[[model_name]][[as.character(i)]], horizontal = TRUE,
+            main = paste("QLIKE of Cluster", i, "\nUsing", model_name), cex.main = 0.9)
+  }
+}
+
+par(mfrow=c(1, 1))
+```
+
+### Example Plot
+
+```{r example plot}
+stock_name_ex = "stock_10"
+time_id_ex = 14126
+
+cluster_ex <- eval_df %>% filter(stock_id == stock_name_ex & time_id == time_id_ex)
+
+forecasts_var <- forecasts_var.ls[[as.integer(cluster_ex$cluster)]]
+forecasts_dcc <- forecasts_dcc.ls[[as.integer(cluster_ex$cluster)]]
+
+predicted_logr_var <- data.frame()
+predicted_logr_dcc <- data.frame()
+
+predicted_vol_var <- data.frame()
+predicted_vol_dcc <- data.frame()
+
+for(i in 1: length(forecasts_var)){
+  predicted_logr_var <- rbind(predicted_logr_var, data.frame(
+    seconds_in_bucket = seq((i+number_of_buckets-1)*30+1, (i+number_of_buckets)*30),
+    log_return = forecasts_var[[i]][paste(stock_name_ex, time_id_ex, sep="_"), ],
+    source = "Vector Auto-Regression Predicted"
+  ))
+  
+  predicted_vol_var <- rbind(predicted_vol_var, data.frame(
+    time_bucket = i+number_of_buckets,
+    volatility = comp_vol(forecasts_var[[i]][paste(stock_name_ex, time_id_ex, sep="_"), ]),
+    source = "Vector Auto-Regression Predicted"
+  ))
+}
+
+
+for(i in 1: length(forecasts_dcc)){
+  
+  predicted_logr_dcc <- rbind(predicted_logr_dcc, data.frame(
+    seconds_in_bucket = seq((i+number_of_buckets-1)*30+1, (i+number_of_buckets)*30),
+    log_return = forecasts_dcc[[i]][paste(stock_name_ex, time_id_ex, sep="_"), ],
+    source = "DCC-GARCH Predicted"
+  ))
+
+  predicted_vol_dcc <- rbind(predicted_vol_dcc, data.frame(
+    time_bucket = i+number_of_buckets,
+    volatility = comp_vol(forecasts_dcc[[i]][paste(stock_name_ex, time_id_ex, sep="_"), ]),
+    source = "DCC-GARCH Predicted"
+  ))
+}
+
+```
+
+```{r}
+actual_logr <- merge(data.frame(seconds_in_bucket = seq(1, 600)), 
+                     log_return_list[[paste(stock_name_ex, ".csv", sep="")]] %>% 
+                       filter(time_id == time_id_ex) %>%
+                       dplyr::select(seconds_in_bucket, log_return), 
+                     by = "seconds_in_bucket", all.x = TRUE) %>%
+  mutate(source = "Realised Log Returns")
+actual_logr$log_return[is.na(actual_logr$log_return)] <- 0
+
+
+actual_vol <-  merge(data.frame(
+  time_bucket = seq(1, 20)), 
+  vol_list[[paste(stock_name_ex, ".csv", sep="")]] %>% 
+    filter(time_id == time_id_ex) %>%
+    dplyr::select(time_bucket, volatility), 
+  by = "time_bucket", all.x = TRUE) %>%
+  mutate(source = "Realised Volatility")
+actual_vol$volatility[is.na(actual_vol$volatility)] <- 0
+```
+
+
+```{r}
+var_model <- var_models.ls[[as.integer(cluster_ex$cluster)]][[11]]
+dcc_model <- dcc_models.ls[[as.integer(cluster_ex$cluster)]][[11]]
+
+forecasts_var <- data.frame(forecast_var_model(var_model))
+forecasts_dcc <- data.frame(forecast_dcc_model(dcc_model))
+
+future_logr_var <- data.frame(
+  seconds_in_bucket = seq(601, 630),
+  log_return = unlist(forecasts_var[paste(stock_name_ex, time_id_ex, sep="_"), ]),
+  source = "Vector Auto-Regression Future"
+)
+
+future_logr_dcc <- data.frame(
+  seconds_in_bucket = seq(601, 630),
+  log_return = unlist(forecasts_dcc[paste(stock_name_ex, time_id_ex, sep="_"), ]),
+  source = "DCC-GARCH Future"
+)
+
+future_vol_var <- data.frame(
+  time_bucket = c(20, 21),
+  volatility = c(actual_vol$volatility[20], comp_vol(future_logr_var$log_return)),
+  source = "Vector Auto-Regression Future")
+
+future_vol_dcc <- data.frame(
+  time_bucket = c(20, 21),
+  volatility = c(actual_vol$volatility[20], comp_vol(future_logr_dcc$log_return)),
+  source = "DCC-GARCH Future")
+
+```
+
+```{r}
+logr_var_plt <- rbind(actual_logr, predicted_logr_var, future_logr_var) %>%
+  ggplot(aes(x = seconds_in_bucket, y = log_return, color = source)) +
+  geom_line() +
+  scale_color_manual(values = c("Realised Log Returns" = "grey", 
+                                "Vector Auto-Regression Predicted" = "blue", 
+                                "Vector Auto-Regression Future" = "red")) +
+  labs(title = paste0("Log Returns and Predictions for ", stock_name_ex, " at time ", time_id_ex),
+       x = "Seconds",
+       y = "Log Return",
+       color = "Source") +
+  theme_minimal()
+
+logr_dcc_plt <- rbind(actual_logr, predicted_logr_dcc, future_logr_dcc) %>%
+  ggplot(aes(x = seconds_in_bucket, y = log_return, color = source)) +
+  geom_line() +
+  scale_color_manual(values = c("Realised Log Returns" = "grey", 
+                                "DCC-GARCH Predicted" = "blue",
+                                "DCC-GARCH Future" = "red")) +
+  labs(title = paste0("Log Returns and Predictions for ", stock_name_ex, " at time ", time_id_ex),
+       x = "Seconds",
+       y = "Log Return",
+       color = "Source") +
+  theme_minimal()
+
+
+grid.arrange(logr_var_plt, logr_dcc_plt, nrow = 2)
+```
+
+```{r}
+vol_var_plt <- rbind(actual_vol, predicted_vol_var, future_vol_var) %>%
+  ggplot(aes(x = time_bucket, y = volatility, color = source)) +
+    geom_line() + 
+    geom_point() +
+    scale_color_manual(values = c("Realised Volatility" = "grey", 
+                                  "Vector Auto-Regression Predicted" = "blue",
+                                  "Vector Auto-Regression Future" = "red")) +
+    labs(title = "Volatility and Predictions for Example Stock for future 30 seconds",
+         x = "Time Bucket",
+         y = "Volatility",
+         color = "Source") +
+    theme_minimal()
+
+vol_dcc_plt <- rbind(actual_vol, predicted_vol_dcc, future_vol_dcc) %>%
+  ggplot(aes(x = time_bucket, y = volatility, color = source)) +
+    geom_line() +
+    geom_point() +
+    scale_color_manual(values = c("Realised Volatility" = "grey", 
+                                  "DCC-GARCH Predicted" = "blue",
+                                  "DCC-GARCH Future" = "red")) +
+    labs(title = "Volatility and Predictions for Example Stock for future 30 seconds",
+         x = "Time Bucket",
+         y = "Volatility",
+         color = "Source") +
+    theme_minimal()
+
+
+grid.arrange(vol_var_plt, vol_dcc_plt, nrow = 2)
+```
+
+## Stability
+
+### Bootstrap Method
+
+Generate bootstrap samples, then test the models on these
+
+If the performance does not significantly decrease on the samples, this indicates model stability
+
+
+```{r bootstrap}
+# First, create a function that returns bootstrap samples of the input sample, using block bootstrap
+# Block bootstrap is a bootstrap method commonly used for time series data
+# Return value is a list
+
+block_bootstrap <- function(x, block_size = 30, n_samples = 1) {
+  n_blocks <- nrow(x) %/% block_size
+  if (n_blocks * block_size < nrow(x)) {n_blocks <- n_blocks + 1}
+
+  # calculate mean and sdev for each block for each stock
+  block.means <- list()
+  block.sdevs <- list()
+
+  for (i in 1 : ncol(x)) {
+    block.means.i <- list()
+    block.sdevs.i <- list()
+
+    for (j in 1 : n_blocks) {
+      upper_limit <- j * block_size
+      lower_limit <- upper_limit - block_size + 1
+      if (j == n_blocks) {upper_limit <- nrow(x)}
+
+      block.means.i[[j]] <- mean(unlist(x[lower_limit:upper_limit,i]))
+      block.sdevs.i[[j]] <- sd(unlist(x[lower_limit:upper_limit,i]))
+    }
+
+    block.means[[i]] <- block.means.i
+    block.sdevs[[i]] <- block.sdevs.i
+  }
+
+  # create the bootstrap samples
+
+  # one list for each sample, then one sublist for each column
+  bootstrap.samples <- list()
+
+  for (k in 1 : n_samples) {
+    bootstrap.samples.k <- list()
+    for (i in 1 : ncol(x)) {
+      sample.i <- list()
+      for (j in 1 : n_blocks) {
+        sample.i[[j]] <- rnorm(block_size, mean = block.means[[i]][[j]], block.sdevs[[i]][[j]])
+      }
+      bootstrap.samples.k[[i]] <- unlist(sample.i)
+    }
+    bootstrap.samples[[k]] <- t(do.call(rbind, bootstrap.samples.k))
+  }
+
+  return(bootstrap.samples)
+}
+
+```
+
+```{r}
+# Test the models on a bootstrap sample
+set.seed(3888)
+
+# bs stands for bootstrap
+bs.forecasts_var.ls <- list()
+bs.forecasts_dcc.ls <- list()
+
+# Create the bootstrap samples
+bs.cluster_feature_ls <- list()
+for (i in 1:length(cluster_feature_ls)) {
+  bs.cluster_feature_ls[[i]] <- block_bootstrap(cluster_feature_ls[[i]])
+}
+
+# randomly select one window
+t <- sample(seq(window_size, nrow(cluster) - 30, by = 30), 1)
+
+cl <- makeCluster(detectCores() - 1)
+
+# Loop through each cluster
+for (i in 1:length(bs.cluster_feature_ls)) {
+
+  cluster <- bs.cluster_feature_ls[[i]][[1]]
+  
+  df <- cluster[(t-window_size+1):t, -1]
+
+  var_model <- vars::VAR(df, p = 4, type = "none")
+  forecasts_var <- forecast_var_model(var_model)
+  rownames(forecasts_var) <- colnames(cluster_feature_ls[[i]][-1])
+
+  arma_model <- dccfit(
+    dccspec(uspec = multispec(replicate(ncol(df), uni_spec, simplify = FALSE)),
+            dccOrder = c(1, 1), distribution = 'mvnorm'),
+    data = df, cluster = cl)
+  forecasts_dcc <- forecast_dcc_model(arma_model)
+  rownames(forecasts_dcc) <- colnames(cluster_feature_ls[[i]][-1])
+
+  bs.forecasts_var.ls[[i]] <- forecasts_var
+  bs.forecasts_dcc.ls[[i]] <- forecasts_dcc
+}
+
+stopCluster(cl)
+
+
+```
+
+### MSE and QLIKE on bootstrap samples
+
+```{r}
+# The similarity between the performance on the bootstrap samples and the original will indicate high stability
+
+BS_MSE_var <- list()
+BS_QLIKE_var <- list()
+BS_MSE_dcc <- list()
+BS_QLIKE_dcc <- list()
+
+for(i in 1: 3){
+
+   filtered_df <- eval_df %>% filter(cluster == as.character(i))
+
+   prediction_var <- bs.forecasts_var.ls[[i]]
+   prediction_dcc <- bs.forecasts_dcc.ls[[i]]
+
+   for(j in 1: nrow(filtered_df)){
+
+    row <- filtered_df[j, ]
+    
+    filtered_vol <- vol_list[[paste0(row$stock_id, ".csv")]] %>% filter(time_id == row$time_id)
+    
+    actual_vol <- filtered_vol %>% filter(time_bucket == (t / 30 + 1)) %>% .$volatility
+    
+    predicted_vol_var <- comp_vol(prediction_var[row$stock_time_id, ])
+    predicted_vol_dcc <- comp_vol(prediction_dcc[row$stock_time_id, ])
+
+    BS_MSE_var[[as.character(i)]] <- c(BS_MSE_var[[as.character(i)]],
+                                    (actual_vol - predicted_vol_var) ^ 2)
+    BS_MSE_dcc[[as.character(i)]] <- c(BS_MSE_dcc[[as.character(i)]],
+                                    (actual_vol - predicted_vol_dcc) ^ 2)
+    
+    BS_QLIKE_var[[as.character(i)]] <- c(BS_QLIKE_var[[as.character(i)]], 
+                                         actual_vol / predicted_vol_var -
+                                                log(actual_vol / predicted_vol_var) - 1)
+    BS_QLIKE_dcc[[as.character(i)]] <- c(BS_QLIKE_dcc[[as.character(i)]], 
+                                          actual_vol / predicted_vol_dcc -
+                                                log(actual_vol / predicted_vol_dcc) - 1)
+
+   }
+
+}
+
+
+```
+
+```{r}
+models <- list(
+  "Vector Auto-Regression" = list(MSE_var, BS_MSE_var),
+  "DCC-GARCH" = list(MSE_dcc, BS_MSE_dcc)
+)
+
+par(mar=c(2, 2, 2, 2), mfrow=c(2, 3))
+
+
+for (model_name in names(models)) {
+  for (i in 1:3) {
+    boxplot(models[[model_name]][[1]][[as.character(i)]],
+            models[[model_name]][[2]][[as.character(i)]], horizontal = TRUE,
+            main = paste("MSE of Cluster", i, "\nUsing", model_name), 
+            names = c("Original", "Bootstrap"),
+            cex.main = 0.9)
+  }
+}
+
+par(mfrow=c(1, 1))
+```
+
+```{r}
+models <- list(
+  "Vector Auto-Regression" = list(QLIKE_var, BS_QLIKE_var),
+  "DCC-GARCH" = list(QLIKE_dcc, BS_QLIKE_dcc)
+)
+
+par(mar=c(2, 2, 2, 2), mfrow=c(2, 3))
+
+
+for (model_name in names(models)) {
+  for (i in 1:3) {
+    boxplot(models[[model_name]][[1]][[as.character(i)]],
+            models[[model_name]][[2]][[as.character(i)]], horizontal = TRUE,
+            main = paste("QLIKE of Cluster", i, "\nUsing", model_name), 
+            names = c("Original", "Bootstrap"),
+            cex.main = 0.9)
+  }
+}
+
+par(mfrow=c(1, 1))
+```
+
+### Stability
+
+
+```{r stability}
+# A function evaluates the stability of VAR and DCC-GARCH models by computing the eigenvalues of their companion matrices across rolling windows.
+
+stability_df.fun <- function(stock_name_ex, time_id_ex, model.ls, model_string) {
+  # Filter evaluation data frame for the specified stock and time ID
+  cluster_ex <- eval_df %>% filter(stock_id == stock_name_ex & time_id == time_id_ex)
+  # Initialize data frames to store eigenvalues
+  eigen_windows_alpha.values.df <- as.data.frame(matrix(nrow = 50))
+  
+  # Initialize eigenvalue data frames based on model type
+  if (model_string == "var") {
+    eigen_windows.values.df <- as.data.frame(matrix(nrow = 200))
+  } else if (model_string == "dcc") {
+    eigen_windows.values.df <- as.data.frame(matrix(nrow = 50))
+  }
+  
+  # Get the list of models for the specified cluster
+  cluster_model.ls <- model.ls[[as.numeric(cluster_ex$cluster)]]
+  number_of_features <- 50
+  number_of_observations <- 300 # Each window
+  
+  # Iterate over each window model in the cluster
+  for (window.index in seq(cluster_model.ls)) {
+    window_model <- cluster_model.ls[[window.index]]
+    
+    # Get coefficients for the specified stock and time ID
+    id <- paste0(stock_name_ex, "_", time_id_ex)
+    
+    if (model_string == "var") {
+      # Calculate eigenvalues for VAR model
+      estimate <- data.frame(coefficients(window_model)[[id]])$Estimate
+      companion_matrix <- array(data = estimate, dim = c(200, 200))
+      eigen_vec_val <- abs(eigen(as.matrix(companion_matrix))$values)
+      
+      etemp.df <- as.data.frame(eigen_vec_val)
+      colnames(etemp.df) <- paste0("eigen_val", window.index)
+      eigen_windows.values.df <- cbind(eigen_windows.values.df, etemp.df)
+      
+    } else if (model_string == "dcc") {
+      # Calculate eigenvalues for DCC-GARCH model
+      estimate <- data.frame(coef(window_model))
+      alpha1 <- estimate[grepl(".alpha1$", rownames(estimate)), ]
+      beta1 <- estimate[grepl(".beta1$", rownames(estimate)), ]
+      
+      # Eigenvalues for beta1 parameter
+      companion_matrix_beta1 <- array(data = beta1, dim = c(50, 50))
+      eigen_vec_val_beta1 <- abs(eigen(as.matrix(companion_matrix_beta1))$values)
+      etemp.df_beta1 <- as.data.frame(eigen_vec_val_beta1)
+      colnames(etemp.df_beta1) <- paste0("eigen_val_beta_", window.index)
+      eigen_windows.values.df <- cbind(eigen_windows.values.df, etemp.df_beta1)
+      
+      # Eigenvalues for alpha1 parameter
+      companion_matrix_alpha1 <- array(data = alpha1, dim = c(50, 50))
+      eigen_vec_val_alpha1 <- abs(eigen(as.matrix(companion_matrix_alpha1))$values)
+      etemp.df_alpha1 <- as.data.frame(eigen_vec_val_alpha1)
+      colnames(etemp.df_alpha1) <- paste0("eigen_val_alpha_", window.index)
+      eigen_windows_alpha.values.df <- cbind(eigen_windows_alpha.values.df, etemp.df_alpha1)
+    }
+  }
+  
+  # Prepare the result to return
+  return_result <- list()
+  return_result[[1]] <- eigen_windows.values.df[, -1] # Remove the initial empty column
+  return_result[[2]] <- eigen_windows_alpha.values.df[, -1] # Remove the initial empty column
+  return(return_result)
+}
+
+```
+
+
+```{r}
+# var var_models.ls
+# example for stability: stock 10, 14126
+stock_name_ex = "stock_10"
+time_id_ex = 14126
+result <- stability_df.fun(stock_name_ex, time_id_ex, var_models.ls, "var")
+eigen_windows.df <- result[[1]]
+
+```
+
+```{r}
+stable_check <- c()
+for (row.index in seq(nrow(eigen_windows.df))){
+  for (col.index in seq(length(eigen_windows.df))){
+    if (eigen_windows.df[row.index, col.index] < 1){
+      stable_check <- c(stable_check, TRUE)
+    }else{
+      stable_check <- c(stable_check, FALSE)
+    }
+  }
+}
+
+```
+
+```{r}
+cat(paste0("The var model is stable: ",(sum(stable_check == TRUE)/length(stable_check))*100, 
+           "% of the modulus of eigenvalue is less than 1."))
+```
+
+```{r}
+eigen_windows_long.df <- eigen_windows.df %>%
+  mutate(lag = 1:n()) %>%
+  pivot_longer(cols = starts_with("eigen_val"), 
+               names_to = "window", 
+               values_to = "eigenvalue") %>%
+  mutate(window = factor(window, levels = paste0("eigen_val", 1:11), labels = paste0("window", 1:11)))
+
+p <- ggplot(eigen_windows_long.df, aes(x = lag, y = eigenvalue, color = window)) + 
+  geom_point() + 
+  xlab("lags") + 
+  ylab("eigenvalue") +
+  theme_minimal()
+
+ggplotly(p)
+```
+
+
+```{r}
+# dcc_models.ls - DCC - GARCH
+# example for stability: stock 10, 14126
+stock_name_ex = "stock_10"
+time_id_ex = 14126
+result <- stability_df.fun(stock_name_ex, time_id_ex, dcc_models.ls, "dcc")
+beta.df <- result[[1]]
+alpha.df <- result[[2]]
+
+```
+
+```{r}
+stable_check <- c()
+for (row.index in seq(nrow(beta.df))){
+  for (col.index in seq(length(beta.df))){
+    if (beta.df[row.index, col.index] < 1){
+      stable_check <- c(stable_check, TRUE)
+    }else{
+      stable_check <- c(stable_check, FALSE)
+    }
+  }
+}
+
+```
+
+```{r}
+cat(paste0("The Multivariate DCC-GARCH model - GARCH term is stable: ",(sum(stable_check == TRUE)/length(stable_check))*100, 
+           "% of the modulus of eigenvalue is less than 1."))
+```
+
+```{r}
+beta_long.df <- beta.df %>%
+  mutate(lag = 1:n()) %>%
+  pivot_longer(cols = starts_with("eigen_val_beta_"), 
+               names_to = "window", 
+               values_to = "eigenvalue") %>%
+  mutate(window = factor(window, levels = paste0("eigen_val_beta_", 1:11), labels = paste0("window", 1:11)))
+
+p <- ggplot(beta_long.df, aes(x = lag, y = eigenvalue, color = window)) + 
+  geom_point() + 
+  xlab("lags") + 
+  ylab("eigenvalue") +
+  theme_minimal()
+
+ggplotly(p)
+```
+
+```{r}
+stable_check <- c()
+for (row.index in 1:nrow(alpha.df)){
+  col.index <- 1
+  while (col.index < length(alpha.df)){
+    
+    if ((alpha.df[row.index, col.index]) < 1){
+      stable_check <- c(stable_check, TRUE)
+    }else{
+      stable_check <- c(stable_check, FALSE)
+    }
+    col.index = col.index + 1
+  }
+}
+
+cat(paste0("The Multivariate DCC-GARCH model - ARCH term is stable: ",(sum(stable_check == TRUE)/length(stable_check))*100, 
+           "% of the modulus of eigenvalue is less than 1."))
+```
+
+```{r}
+alpha.long.df <- alpha.df %>%
+  mutate(lag = 1:n()) %>%
+  pivot_longer(cols = starts_with("eigen_val_alpha"), 
+               names_to = "window", 
+               values_to = "eigenvalue") %>%
+  mutate(window = factor(window, levels = paste0("eigen_val_alpha_", 1:11), labels = paste0("window", 1:11)))
+
+p <- ggplot(alpha.long.df, aes(x = lag, y = eigenvalue, color = window)) + 
+  geom_point() + 
+  xlab("lags") + 
+  ylab("eigenvalue") +
+  theme_minimal()
+
+ggplotly(p)
+```
+
